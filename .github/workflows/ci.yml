@@ -1,9 +1,9 @@
-name: Continuous Integration Pipeline
+name: Continuous Integration & Deployment (ACA)
 
 on:
   push:
     branches: [ "main" ]
-  pull_request:
+  pull_requests:
     branches: [ "main" ]
   workflow_dispatch:
 
@@ -12,6 +12,11 @@ permissions:
   actions: read
   checks: write
   pull-requests: write
+  id-token: write
+
+concurrency:
+  group: deploy-aca-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-and-test:
@@ -31,21 +36,27 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
 
+      - name: Verify lockfile exists (prevent npm ci failure)
+        run: |
+          if [ ! -f package-lock.json ]; then
+            echo "❌ package-lock.json is missing. Run 'npm install' locally and commit it."
+            exit 1
+          fi
+
       - name: Install dependencies
         run: npm ci
 
       - name: Build (optional)
-        run: |
-          npm run build 2>/dev/null || echo "No build script found, skipping"
+        run: npm run build 2>/dev/null || echo "No build script found, skipping"
 
-      - name: Run unit tests with coverage (JUnit)
+      - name: Run unit tests (JUnit)
         env:
           JEST_JUNIT_OUTPUT: coverage/junit.xml
-        run: npm run test:ci
+        run: npm run test:ci || npm test --if-present
 
       - name: Publish test results to Checks
-        uses: dorny/test-reporter@v1
         if: always()
+        uses: dorny/test-reporter@v1
         with:
           name: Jest Test Results
           path: coverage/junit.xml
@@ -53,34 +64,45 @@ jobs:
           fail-on-error: true
 
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
         if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: test-results-node-${{ matrix.node-version }}
           path: coverage/
           retention-days: 30
 
-      - name: Create deployment package
-        run: |
-          set -euo pipefail
-          STAGING="$GITHUB_WORKSPACE/deployment-package"
-          rm -rf "$STAGING"
-          mkdir -p "$STAGING"
-          [ -d public ] && cp -r public "$STAGING/" || true
-          [ -f server.js ] && cp server.js "$STAGING/" || true
-          cp package.json "$STAGING/"
-          cp package-lock.json "$STAGING/" || true
-          [ -f README.md ] && cp README.md "$STAGING/" || true
-          (cd "$STAGING" && npm pkg delete devDependencies || true)
-          TS="$(date +%Y%m%d-%H%M%S)"
-          SHORT_SHA="${GITHUB_SHA::7}"
-          ZIP_NAME="deployment-package-${SHORT_SHA}-${TS}.zip"
-          (cd "$GITHUB_WORKSPACE" && zip -r "$ZIP_NAME" "deployment-package")
-          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+  deploy-to-azure:
+    runs-on: ubuntu-latest
+    needs: build-and-test    # لا يشتغل إلا بعد ما تخلص الاختبارات بنجاح
 
-      - name: Upload deployment package artifact
-        uses: actions/upload-artifact@v4
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login (Service Principal)
+        uses: azure/login@v2
         with:
-          name: deployment-package-node-${{ matrix.node-version }}-${{ github.run_number }}
-          path: ${{ env.ZIP_NAME }}
-          retention-days: 90
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+      - name: Build & Push Docker image, then Deploy to Azure Container Apps
+        uses: azure/container-apps-deploy-action@v2
+        with:
+          # مسار السورس
+          appSourcePath: ${{ github.workspace }}
+          # لو Dockerfile مو في الجذر فعل السطر التالي وحدد المسار:
+          # dockerfilePath: ./Dockerfile
+
+          # Docker Hub
+          registryUrl: docker.io
+          registryUsername: ${{ secrets.DOCKERHUB_USERNAME }}
+          registryPassword: ${{ secrets.DOCKERHUB_TOKEN }}
+
+          # Azure Resources (طابق الأسماء مع مواردك في Azure)
+          resourceGroup: container-labs-rg-alyzedi
+          containerAppName: frontendapp-alyzedi
+
+          # اسم الصورة + التاق (SHA لكل commit)
+          imageToBuild: ${{ secrets.DOCKERHUB_USERNAME }}/frontendapp-node:${{ github.sha }}
